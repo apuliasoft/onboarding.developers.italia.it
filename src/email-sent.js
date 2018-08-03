@@ -1,6 +1,8 @@
 'use strict';
 
 const fs = require('fs-extra');
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
 const nodemailer = require('nodemailer');
 const mustache = require('mustache');
 const jwt = require('jsonwebtoken');
@@ -9,6 +11,14 @@ const parseDomain = require('parse-domain');
 const key = require('./get-jwt-key.js')();
 const amministrazioni = require('../public/assets/data/authorities.db.json');
 
+const whitelistFile = 'private/data/whitelist.db.json';
+fs.ensureFileSync(whitelistFile);
+const adapter = new FileSync(whitelistFile);
+const db = low(adapter);
+
+// Set some defaults (required if your JSON file is empty)
+db.defaults({ registrati: [] }).write();
+
 module.exports = function (request, h) {
   const referente = request.payload.nomeReferente;
   const ipa = request.payload.ipa;
@@ -16,43 +26,73 @@ module.exports = function (request, h) {
   const pec = amministrazioni[ipa].pec;
   const amministrazione = amministrazioni[ipa].description;
 
+  if (db.get('registrati').find({ url: url }).value()) {
+    let data = { errorMsg: `La url ${url} esiste gia' nel database` };
+    return h.view('main-content', data, { layout: 'index' });
+  } 
   if (!isValid(url)) {
     let data = { errorMsg: 'Indirizzo URL invalido: ricompila il form' };
     return h.view('main-content', data, { layout: 'index' });
   }
 
-  // Generate test SMTP service account from ethereal.email
-  // Only needed if you don't have a real mail account for testing
-  nodemailer.createTestAccount((err, account) => {
-    // create reusable transporter object using the default SMTP transport
+  const mailServerConfig = JSON.parse(process.argv.includes('dev') ?
+    fs.readFileSync('config-dev.json').toString('utf8') :
+    fs.readFileSync('config-prod.json').toString('utf8'));
+
+  if (process.argv.includes('dev')) {
+    // Generate test SMTP service account from ethereal.email
+    // Only needed if you don't have a real mail account for testing
+    nodemailer.createTestAccount((err, account) => {
+      // create reusable transporter object using the default SMTP transport
+      const transporter = nodemailer.createTransport({
+        host: mailServerConfig.host,
+        port: mailServerConfig.port,
+        secure: mailServerConfig.secure, // true for 465, false for other ports
+        auth: {
+          user: account.user,
+          pass: account.pass
+        }
+      });
+      sendEmail(transporter);
+    });
+  } else {
+    const configAccountString = fs.readFileSync('account-config.json').toString('utf8');
+    const accountConfig = JSON.parse(configAccountString); 
+
     const transporter = nodemailer.createTransport({
-      host: 'smtp.ethereal.email',
-      port: 587,
-      secure: false, // true for 465, false for other ports
+      host: mailServerConfig.host,
+      port: mailServerConfig.port,
+      secure: mailServerConfig.secure, // true for 465, false for other ports
       auth: {
-        user: account.user, // generated ethereal user
-        pass: account.pass // generated ethereal password
+        user: accountConfig.user,
+        pass: accountConfig.pass
       }
     });
+    sendEmail(transporter);
+  }
 
+  function sendEmail(transporter) {
     const template = fs.readFileSync('src/tpl/email.mst').toString('utf8');
-
     const token = jwt.sign({
       referente: referente,
       ipa: ipa,
       url: url
     }, key);
 
+    const destinationLink = JSON.parse(process.argv.includes('dev')) ?
+      `http://${mailServerConfig.applicationHost}:${mailServerConfig.applicationPort}/registered?token=${token}` :
+      `http://${mailServerConfig.applicationHost}/registered?token=${token}`;
+
     // setup email data with unicode symbols
     const mailOptions = {
       from: '"Team Digitale" <test@teamdigitale.com>', // sender address
-      to: 'giuseppesantoro87@gmail.com', // list of receivers
+      to: pec, // list of receivers
       subject: 'Onboarding Developer Italia', // Subject line
       html: mustache.render(template, {
         referente: referente,
         url: url,
         amministrazione: amministrazione,
-        link: `http://localhost:3000/register-confirm?token=${token}`
+        link: destinationLink
       })
     };
 
@@ -65,7 +105,7 @@ module.exports = function (request, h) {
       // Preview only available when sending through an Ethereal account
       console.log('Preview URL: %s', nodemailer.getTestMessageUrl(info));
     });
-  });
+  }
 
   let data = { pec: pec };
   return h.view('email-sent', data, { layout: 'index' });
